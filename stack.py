@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """中文 Docker Compose 项目管理器，默认管理 /opt/stacks。"""
 from __future__ import annotations
-import argparse, json, os, re, shutil, subprocess, sys
+import argparse, json, os, re, shutil, subprocess, sys, tempfile
 from pathlib import Path
+from urllib.request import Request, urlopen
+
+VERSION = "0.2.0"
+RAW_URL = "https://raw.githubusercontent.com/beiwang02/stacks/main/stack.py"
 
 ROOT = Path(os.environ.get("STACKS_ROOT", "/opt/stacks"))
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
@@ -149,12 +153,105 @@ def confirm(prompt: str) -> bool:
     return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes", "是")
 
 
-def update(name: str, build=False):
+def require_project(name: str) -> tuple[Path, Path]:
     path = project_path(name)
     if not path.is_dir() or path.is_symlink():
         fail("项目不存在或不是安全的项目目录。")
+    return path, compose_file(path)
+
+
+def remove(name: str, data=False):
+    path, f = require_project(name)
+    if not sys.stdin.isatty():
+        fail("删除必须在交互式终端操作，不接受管道确认。")
+    path = path.resolve()
+    f = path / f.name
+    cmd = ["docker", "compose", "-f", str(f)]
+    result = run(cmd + ["config", "--format", "json"], cwd=path, capture=True)
+    try:
+        compose_name = json.loads(result.stdout)["name"] if not result.returncode else None
+    except (ValueError, TypeError, KeyError):
+        compose_name = None
+    if not isinstance(compose_name, str) or not NAME_RE.fullmatch(compose_name):
+        fail("无法确认实际 Compose 项目名，未执行删除。")
+    result = run(["docker", "ps", "-a", "--filter", f"label=com.docker.compose.project={compose_name}",
+                  "--format", '{{.Label "com.docker.compose.project.working_dir"}}'], cwd=path, capture=True)
+    if result.returncode or any(not line or Path(line).resolve() != path for line in result.stdout.splitlines()):
+        fail("无法核对容器归属，或发现同名项目的容器来自其他目录，未执行删除。")
+    print(f"目录：{path}\n实际 Compose 项目：{compose_name}")
+    print("将停止并移除项目容器，原目录整体移入 .removed，保留目录内文件和绑定挂载数据。")
+    print("本次会尝试删除 Compose 管理的卷。" if data else "本次不会删除 Docker 数据卷。")
+    if input(f"请输入项目名 {name} 以继续：").strip() != name:
+        print("项目名不匹配，已取消。")
+        return
+    if not confirm("确认移除容器并归档项目目录？"):
+        print("已取消。")
+        return
+    if data:
+        print("警告：--data 会删除该 Compose 项目管理的命名卷和匿名卷，数据可能无法恢复。")
+        if input(f"再次输入项目名 {name}：").strip() != name:
+            print("项目名不匹配，已取消。")
+            return
+        if input("请输入 DELETE DATA 才能删除数据卷：").strip() != "DELETE DATA":
+            print("危险确认不匹配，已取消。")
+            return
+    archive = path.parent / ".removed"
+    if archive.is_symlink():
+        fail("归档目录是符号链接，未执行删除。")
+    try:
+        archive.mkdir(mode=0o700, exist_ok=True)
+        slot = Path(tempfile.mkdtemp(prefix=f"{name}-", dir=archive))
+    except OSError as exc:
+        fail(f"无法创建归档位置，未执行删除：{exc}")
+    target = slot / name
+    try:
+        if run(cmd + ["-p", compose_name, "down"] + (["-v"] if data else []), cwd=path).returncode:
+            fail("Compose 移除失败，原目录未移动；容器或卷可能已部分移除。")
+        path.rename(target)
+    except OSError as exc:
+        fail(f"操作未完整完成，请检查容器状态；原目录未归档：{exc}")
+    finally:
+        if not target.exists():
+            slot.rmdir()
+    print(f"项目目录已归档：{target}")
+
+
+def self_update():
+    target = Path(__file__).resolve()
+    if not target.is_file():
+        fail("无法定位当前脚本文件。")
+    print(f"将从 GitHub 更新：{RAW_URL}")
+    if not confirm("确认更新 Stacks 工具本身？"):
+        print("已取消。")
+        return
+    try:
+        request = Request(RAW_URL, headers={"User-Agent": "stacks-self-update"})
+        with urlopen(request, timeout=30) as response:
+            content = response.read(1024 * 1024 + 1)
+        if len(content) > 1024 * 1024 or not content.startswith(b"#!") or not re.search(rb'^VERSION = "[0-9]+\.[0-9]+\.[0-9]+"$', content, re.M):
+            fail("下载内容不像有效的 Stacks Python 脚本，已停止。")
+        compile(content, str(target), "exec")
+        if target.read_bytes() == content:
+            print(f"已是最新版本：{VERSION}")
+            return
+        mode = target.stat().st_mode
+        fd, temp_name = tempfile.mkstemp(prefix=".stack-update-", dir=str(target.parent))
+        try:
+            with os.fdopen(fd, "wb") as temp:
+                temp.write(content)
+            os.chmod(temp_name, mode)
+            os.replace(temp_name, target)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+    except (OSError, SyntaxError) as exc:
+        fail(f"更新失败，原脚本未替换：{exc}")
+    print(f"更新完成：{target}")
+
+
+def update(name: str, build=False):
+    path, f = require_project(name)
     inspect_config(path)
-    f = compose_file(path)
     if build:
         print("将执行源码构建，可能改变运行中的服务。")
     else:
@@ -211,6 +308,7 @@ def menu():
         for i, p in enumerate(items, 1): print(f"  {i}. {p.name}")
         print("  n. 安装新项目（逐行粘贴 Compose）")
         print("  o. 扫描并整理其他目录")
+        print("  d. 删除项目（多重确认）")
         print("  q. 退出")
         choice = input("选择：").strip()
         if choice == "q": return
@@ -220,6 +318,9 @@ def menu():
         if choice == "o":
             source = input("扫描目录：").strip()
             organize(source, move=confirm("是否移动原目录？（否：复制）")); continue
+        if choice == "d":
+            name = input("项目名：").strip()
+            remove(name); continue
         if choice.isdigit() and 1 <= int(choice) <= len(items):
             name = items[int(choice)-1].name
             action = input(f"{name}：u 更新，l 日志，s 状态，r 重启，q 返回：").strip().lower()
@@ -234,10 +335,15 @@ def menu():
 
 def main():
     parser = argparse.ArgumentParser(description="Stacks 中文 Docker Compose 管理器")
+    parser.add_argument("--version", action="version", version=f"Stacks {VERSION}")
     sub = parser.add_subparsers(dest="action")
     sub.add_parser("list", help="列出 Compose 项目")
+    sub.add_parser("self-update", help="更新 Stacks 工具自身")
     u = sub.add_parser("update", help="更新项目")
     u.add_argument("name"); u.add_argument("--build", action="store_true")
+    d = sub.add_parser("remove", help="删除项目；默认保留数据卷")
+    d.add_argument("name")
+    d.add_argument("--data", action="store_true", help="危险：同时删除 Compose 数据卷")
     o = sub.add_parser("organize", help="扫描并整理 Compose 项目")
     o.add_argument("source", help="待扫描目录")
     o.add_argument("--move", action="store_true", help="移动原目录；默认复制")
@@ -245,10 +351,19 @@ def main():
     args = parser.parse_args()
     if args.action == "list":
         for p in projects(): print(p.name)
+    elif args.action == "self-update":
+        self_update()
+    elif args.action == "remove":
+        require_tools(); remove(args.name, args.data)
     elif args.action == "update":
         require_tools(); update(args.name, args.build)
     elif args.action == "organize":
         organize(args.source, args.move, args.max_depth)
     else: menu()
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    try:
+        main()
+    except (EOFError, KeyboardInterrupt):
+        print("\n操作已中断，请核对当前状态。", file=sys.stderr)
+        raise SystemExit(130)
