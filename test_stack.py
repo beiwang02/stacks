@@ -1,4 +1,4 @@
-import os, tempfile, unittest
+import os, tempfile, unittest, tarfile
 from unittest import mock
 from pathlib import Path
 import stack
@@ -85,6 +85,22 @@ class StackTests(unittest.TestCase):
         self.assertFalse(project.exists())
         archived, = (stack.ROOT / '.removed').glob('*/demo/data')
         self.assertEqual(archived.read_text(), 'keep me')
+
+    def test_backup_creates_archive_without_docker(self):
+        project = stack.ROOT / 'demo'; project.mkdir()
+        (project / 'compose.yaml').write_text('services: {}')
+        (project / 'data.txt').write_text('keep')
+        output = Path(self.tmp.name) / 'backup.tar.gz'
+        stack.backup('demo', str(output))
+        self.assertTrue(output.is_file())
+        with tarfile.open(output) as archive:
+            self.assertIn('demo/compose.yaml', archive.getnames())
+
+    def test_backup_refuses_overwrite(self):
+        project = stack.ROOT / 'demo'; project.mkdir()
+        (project / 'compose.yaml').write_text('services: {}')
+        output = Path(self.tmp.name) / 'backup.tar.gz'; output.write_text('existing')
+        with self.assertRaises(SystemExit): stack.backup('demo', str(output))
 
     def test_self_update_preserves_original_on_invalid_python(self):
         target = stack.ROOT / 'stack.py'; target.write_text('original')

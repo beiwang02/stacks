@@ -8,6 +8,8 @@
 - 逐行粘贴安装新的 `compose.yaml`，输入 `.完成` 结束
 - 扫描其他目录，复制或移动包含 Compose 文件的项目到统一目录
 - 更新单个项目：拉取镜像后 `up -d --no-build`
+- 独立执行 `start`、`stop`、`restart`、`status`、`logs`、`config`、`pull`
+- 将项目目录备份为 `.tar.gz`，默认不覆盖已有备份
 - `self-update` 更新 Stacks 工具自身，并校验下载脚本后原子替换
 - 多重确认删除项目：默认保留 Docker 数据卷，并将编排目录归档到 `.removed/`
 - `--data` 才允许删除 Compose 数据卷，并要求额外输入 `DELETE DATA`
@@ -34,6 +36,14 @@ stack                 # 中文菜单
 stack list            # 列出项目
 stack update sub-store
 stack update sub-store --build  # 显式允许构建，仍会先确认
+stack start sub-store
+stack stop sub-store
+stack restart sub-store
+stack status sub-store
+stack logs sub-store --tail 200
+stack config sub-store
+stack pull sub-store
+stack backup sub-store -o /opt/backups/sub-store.tar.gz
 stack self-update                  # 更新 Stacks 自身，确认后原子替换脚本
 stack remove sub-store             # 移除容器并归档编排目录，保留数据卷
 stack remove sub-store --data      # 危险：额外确认后删除数据卷，再归档目录

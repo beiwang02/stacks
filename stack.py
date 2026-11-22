@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """中文 Docker Compose 项目管理器，默认管理 /opt/stacks。"""
 from __future__ import annotations
-import argparse, json, os, re, shutil, subprocess, sys, tempfile
+import argparse, json, os, re, shutil, subprocess, sys, tempfile, tarfile
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -249,6 +249,37 @@ def self_update():
     print(f"更新完成：{target}")
 
 
+def compose_action(name: str, action: str, tail: int = 100):
+    path, f = require_project(name)
+    commands = {
+        "start": ["up", "-d", "--no-build"],
+        "stop": ["stop"],
+        "restart": ["restart"],
+        "status": ["ps"],
+        "logs": ["logs", "--tail", str(tail)],
+        "config": ["config"],
+        "pull": ["pull"],
+    }
+    if action not in commands:
+        fail(f"不支持的 Compose 操作：{action}")
+    if action in {"start", "stop", "restart", "pull"} and not confirm(f"确认执行 {action}？"):
+        print("已取消。")
+        return
+    if run(["docker", "compose", "-f", str(f)] + commands[action], cwd=path).returncode:
+        fail(f"Compose 操作失败：{action}")
+
+
+def backup(name: str, output: str | None = None):
+    path, _ = require_project(name)
+    destination = Path(output).expanduser() if output else Path.cwd() / f"{name}.tar.gz"
+    if destination.exists():
+        fail(f"备份目标已存在，为避免覆盖已停止：{destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(destination, "w:gz") as archive:
+        archive.add(path, arcname=name, recursive=True)
+    print(f"备份完成：{destination}")
+
+
 def update(name: str, build=False):
     path, f = require_project(name)
     inspect_config(path)
@@ -323,13 +354,13 @@ def menu():
             remove(name); continue
         if choice.isdigit() and 1 <= int(choice) <= len(items):
             name = items[int(choice)-1].name
-            action = input(f"{name}：u 更新，l 日志，s 状态，r 重启，q 返回：").strip().lower()
-            path = project_path(name); f = compose_file(path)
+            action = input(f"{name}：u 更新，a 启动，t 停止，r 重启，l 日志，s 状态，c 校验，p 拉镜像，b 备份，q 返回：").strip().lower()
             if action == "u": update(name)
-            elif action == "l": run(["docker", "compose", "-f", str(f), "logs", "--tail=100"], cwd=path)
-            elif action == "s": run(["docker", "compose", "-f", str(f), "ps"], cwd=path)
-            elif action == "r":
-                if confirm("确认重启项目？"): run(["docker", "compose", "-f", str(f), "restart"], cwd=path)
+            elif action in {"a", "t", "r", "l", "s", "c", "p"}:
+                compose_action(name, {"a": "start", "t": "stop", "r": "restart", "l": "logs", "s": "status", "c": "config", "p": "pull"}[action])
+            elif action == "b":
+                output = input("备份路径（留空使用当前目录/<项目名>.tar.gz）：").strip() or None
+                backup(name, output)
         else: print("无效选择。")
 
 
@@ -339,6 +370,14 @@ def main():
     sub = parser.add_subparsers(dest="action")
     sub.add_parser("list", help="列出 Compose 项目")
     sub.add_parser("self-update", help="更新 Stacks 工具自身")
+    for action in ("start", "stop", "restart", "status", "logs", "config", "pull"):
+        command = sub.add_parser(action, help=f"{action} Compose 项目")
+        command.add_argument("name")
+        if action == "logs":
+            command.add_argument("--tail", type=int, default=100)
+    b = sub.add_parser("backup", help="备份项目编排目录")
+    b.add_argument("name")
+    b.add_argument("-o", "--output")
     u = sub.add_parser("update", help="更新项目")
     u.add_argument("name"); u.add_argument("--build", action="store_true")
     d = sub.add_parser("remove", help="删除项目；默认保留数据卷")
@@ -355,6 +394,10 @@ def main():
         self_update()
     elif args.action == "remove":
         require_tools(); remove(args.name, args.data)
+    elif args.action in {"start", "stop", "restart", "status", "logs", "config", "pull"}:
+        require_tools(); compose_action(args.name, args.action, getattr(args, "tail", 100))
+    elif args.action == "backup":
+        backup(args.name, args.output)
     elif args.action == "update":
         require_tools(); update(args.name, args.build)
     elif args.action == "organize":
